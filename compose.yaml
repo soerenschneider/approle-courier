@@ -1,0 +1,105 @@
+# Local test setup: dev-mode OpenBao, a one-shot init that configures it
+# (testenv/init.sh), and approle-courier using AppRole and the KV registry,
+# behind HAProxy (testenv/haproxy.cfg).
+#
+#   docker compose up -d --build --wait   # start
+#   docker compose run --rm e2e           # run the machine flow end to end
+#   docker compose logs -f approle-courier
+#   docker compose down -v                # stop and delete all state
+#
+# OpenBao runs in dev mode (in-memory, unsealed, root token "root"): never use
+# this outside local testing. Restarting the openbao container loses all
+# state; run "docker compose up -d --force-recreate init approle-courier" after.
+name: approle-courier-test
+
+x-tools: &tools
+  image: approle-courier-testenv-tools
+  build:
+    context: testenv
+    dockerfile_inline: |
+      FROM alpine:3.22
+      RUN apk add --no-cache age curl jq openssl
+  volumes:
+    - ./testenv:/testenv:ro
+    - machine:/machine
+    - service-creds:/run/approle-courier
+    - certs:/certs
+
+services:
+  openbao:
+    image: openbao/openbao:2.7.3@sha256:ba4b133eb9586630024e71a617e66f37f29cc3534cdd46a6233e098ceded8dc9
+    command: server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200
+    environment:
+      BAO_ADDR: http://127.0.0.1:8200
+    ports:
+      - 8200:8200
+    healthcheck:
+      test: [CMD, bao, status]
+      interval: 2s
+      retries: 30
+
+  init:
+    <<: *tools
+    command: [/testenv/init.sh]
+    environment:
+      BAO_ADDR: http://openbao:8200
+      BAO_TOKEN: root
+    depends_on:
+      openbao:
+        condition: service_healthy
+
+  haproxy:
+    image: haproxy:3.4.8-alpine@sha256:8aa6458a9d22a8364a2d2ee9ce93de0cc4a2789e3cf63f0b44adc972863724d7
+    volumes:
+      - ./testenv/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - certs:/certs:ro
+    ports:
+      - 8080:8080
+    networks:
+      default:
+        # Fixed, so approle-courier can trust it in -trusted-proxies.
+        ipv4_address: 172.30.0.250
+    depends_on:
+      - approle-courier
+
+  approle-courier:
+    build: .
+    command: [-config=/etc/approle-courier/config.json]
+    # drain_delay (5s) + graceful shutdown (up to 10s) + token revocation.
+    stop_grace_period: 20s
+    # API only through haproxy; metrics published directly.
+    ports:
+      - 9090:9090
+    volumes:
+      - ./testenv/approle-courier.json:/etc/approle-courier/config.json:ro
+      - service-creds:/run/approle-courier:ro
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  e2e:
+    <<: *tools
+    profiles: [e2e]
+    command: [/testenv/e2e.sh]
+    # Only the machine's identity and the CA, not the service's credentials.
+    volumes:
+      - ./testenv:/testenv:ro
+      - machine:/machine:ro
+      - certs:/certs:ro
+    environment:
+      BB_ADDR: https://haproxy:8080
+      CA_CERT: /certs/ca.pem
+      BB_METRICS_ADDR: http://approle-courier:9090
+      BAO_ADDR: http://openbao:8200
+    # No depends_on: it would re-run init. e2e.sh waits for approle-courier.
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  machine:
+  service-creds:
+  certs:

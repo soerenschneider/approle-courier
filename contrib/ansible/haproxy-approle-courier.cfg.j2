@@ -1,0 +1,65 @@
+{% if approle_courier_enabled | default(false) %}
+#---------------------------------------------------------------------
+# approle-courier
+#
+# HAProxy terminates TLS (haproxy_cert_file must cover the name machines
+# connect to) and forwards plain HTTP to approle-courier on every node. The
+# client address is passed on with the PROXY protocol to nodes that set
+# approle_courier_proxy_protocol, and in X-Forwarded-For otherwise; either
+# way approle-courier needs every OpenBao node's address in trusted_proxies.
+# A PROXY header sent to a node not expecting one is answered with 400.
+#
+# Servers are reached at their approle_courier_listen_address, or at
+# 127.0.0.1 (this node) and their inventory name (other nodes) if it is
+# unset or a wildcard. A node bound to loopback only serves its own HAProxy;
+# the others mark it down. A node that sets approle_courier_tls_cert is spoken to
+# over TLS, verified against haproxy_approle_courier_ca_file and its
+# inventory name.
+#
+# Challenges are kept in memory per instance, so a machine's challenge and
+# its SecretID request must reach the same instance. Hashing the client
+# address consistently sends both to the same node, whichever HAProxy they
+# enter through, as long as every node lists the same servers in the same
+# order.
+#
+# Health endpoint /readyz returns:
+#   200 ready
+#   503 registry unreadable, Vault token expired or shutting down
+#---------------------------------------------------------------------
+frontend approle_courier_https
+    description approle-courier over https
+    mode http
+    option httplog
+    bind *:{{ haproxy_approle_courier_port }} ssl crt {{ haproxy_cert_file }}
+    default_backend approle_courier
+
+# Not named like the frontend: HAProxy 3.3 rejects a frontend and a backend
+# sharing a name.
+backend approle_courier
+    mode http
+    balance source
+    hash-type consistent
+    option httpchk GET /readyz
+    http-check expect status 200
+    # Ignored by nodes using the PROXY protocol: the client address it
+    # gives is not a trusted proxy.
+    option forwardfor
+    default-server check inter 2s fall 2 rise 2
+{% for node in groups['openbao'] if hostvars[node].approle_courier_enabled | default(false) %}
+{%   set n = hostvars[node] %}
+{%   set addr = n.approle_courier_listen_address | default('') %}
+{%   if node != inventory_hostname and (addr in ['localhost', '::1'] or addr.startswith('127.')) %}
+{#     Unreachable from here; listed anyway so every HAProxy hashes over the
+       same servers, and marked down by the health check. #}
+{%     set addr = node %}
+{%   elif addr in ['', '0.0.0.0', '::'] %}
+{%     set addr = '127.0.0.1' if node == inventory_hostname else node %}
+{%   elif ':' in addr and not addr.startswith('[') %}
+{%     set addr = '[' ~ addr ~ ']' %}
+{%   endif %}
+    server {{ node.split('.')[0] }} {{ addr }}:{{ n.approle_courier_port | default(8300) }}
+{%-  if n.approle_courier_proxy_protocol | default(false) %} send-proxy-v2 check-send-proxy{% endif %}
+{%-  if n.approle_courier_tls_cert | default("") %} ssl verify required ca-file {{ haproxy_approle_courier_ca_file | mandatory }} sni str({{ node }}) verifyhost {{ node }} check-sni {{ node }}{% endif %}
+
+{% endfor %}
+{% endif %}

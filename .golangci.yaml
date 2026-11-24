@@ -1,0 +1,30 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - cyclop
+    - gosec
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Table-driven tests and assertion sequences inflate complexity
+      # without making the tests harder to follow.
+      - path: _test\.go
+        linters:
+          - cyclop
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

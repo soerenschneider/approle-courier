@@ -1,0 +1,6 @@
+.git
+.idea
+*.iml
+compose.yaml
+testenv
+contrib

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
+  "postUpdateOptions": ["gomodTidy"],
+  "semanticCommits": "enabled",
+  "packageRules": [
+    {
+      "description": "Indirect Go dependencies stay at what the direct ones require. Bumping oapi-codegen's indirect dependencies on their own once broke code generation (mixed yaml v3/v4); CI's 'generated code up to date' job catches that.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": false
+    },
+    {
+      "description": "oapi-codegen is a tool dependency (listed as indirect); update it explicitly so generated code is refreshed with it.",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/oapi-codegen/oapi-codegen/v2"],
+      "enabled": true,
+      "groupName": "oapi-codegen"
+    },
+    {
+      "description": "Keep the Go toolchain in go.mod and the build image in step.",
+      "matchPackageNames": ["go", "golang"],
+      "groupName": "go"
+    }
+  ]
+}

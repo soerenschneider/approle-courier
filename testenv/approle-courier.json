@@ -1,0 +1,24 @@
+{
+  "listen": {
+    "api": ":8080",
+    "metrics": ":9090",
+    "proxy_protocol": true,
+    "trusted_proxies": ["172.30.0.250"]
+  },
+  "limits": {
+    "bind_client_address": ["approle/demo"],
+    "exclusive_secret_id": ["approle/demo"]
+  },
+  "registry": {
+    "kv_mount": "secret",
+    "kv_path": "approle-courier/registry"
+  },
+  "vault": {
+    "address": "http://openbao:8200",
+    "approle": {
+      "mount": "approle-service",
+      "role_id": "approle-courier",
+      "secret_id_file": "/run/approle-courier/secret-id"
+    }
+  }
+}

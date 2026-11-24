@@ -1,0 +1,460 @@
+openapi: 3.1.0
+info:
+  title: approle-courier API
+  version: 0.4.0
+  summary: Issue response-wrapped, age-encrypted AppRole SecretIDs from Vault/OpenBao.
+  description: |
+    approle-courier generates a new AppRole `secret_id` for a given role, asks
+    Vault/OpenBao to response-wrap it, and returns the wrapping token encrypted
+    with [age](https://age-encryption.org) to the calling machine's registered
+    age recipient.
+
+    The plaintext `secret_id` is never returned and never leaves Vault: the
+    service only handles the single-use wrapping token. The machine decrypts it
+    with its age identity and unwraps it via `POST /v1/sys/wrapping/unwrap`.
+
+    ## Machine authentication
+
+    Each machine is registered server-side with a `machine_id`, its age
+    recipient (`age1...`) and the AppRole roles it may request. age keys
+    cannot sign, so the machine proves possession of its identity by
+    challenge-response:
+
+      1. `POST /v1/auth/challenge` with `machine_id`. The server generates a
+         random single-use token and returns it age-encrypted to that
+         machine's registered recipient.
+      2. The machine decrypts the challenge (`age -d -i key.txt`) and sends
+         the plaintext as `Authorization: Bearer <token>` on the next request.
+      3. The server accepts the token once, before `expires_at`, and only for
+         the machine it was issued to.
+
+    Independently of the challenge, every response secret is encrypted to the
+    registered recipient, never to a key supplied in the request. A stolen
+    challenge token therefore only lets an attacker create a SecretID they
+    cannot decrypt; the challenge exists to stop unauthenticated callers from
+    creating SecretIDs at all.
+
+    ## SecretID flow
+
+      1. `POST auth/{mount}/role/{role_name}/secret-id` with `X-Vault-Wrap-TTL`
+      2. age-encrypt the returned `wrap_info.token` to the machine's recipient
+      3. Return the ciphertext plus non-sensitive wrap metadata
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: https://approle-courier.example.com
+    description: Example deployment
+
+security:
+  - ageChallenge: []
+
+tags:
+  - name: auth
+    description: Machine authentication via age challenge-response
+  - name: approle
+    description: AppRole SecretID issuance
+
+paths:
+  /v1/auth/challenge:
+    post:
+      tags: [auth]
+      operationId: createChallenge
+      summary: Request an age-encrypted authentication challenge
+      description: |
+        Returns a single-use bearer token encrypted to the registered age
+        recipient of `machine_id`. Only the holder of the matching age
+        identity can decrypt it. This endpoint is unauthenticated, so it is
+        rate limited per client address (an IPv4 address or IPv6 /64), and
+        each client address may hold at most 5 pending challenges per
+        `machine_id`. Limits are per client address, so a third party who
+        knows a `machine_id` cannot lock that machine out. Behind a reverse
+        proxy, the client address comes from `X-Forwarded-For` or the PROXY
+        protocol, but only for proxies the server is configured to trust.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChallengeRequest'
+            example:
+              machine_id: node-42
+      responses:
+        '201':
+          description: Challenge issued.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChallengeResponse'
+              example:
+                machine_id: node-42
+                recipient: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+                challenge:
+                  format: age-armor
+                  value: |
+                    -----BEGIN AGE ENCRYPTED FILE-----
+                    YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBleGFtcGxlCg==
+                    -----END AGE ENCRYPTED FILE-----
+                expires_at: '2026-10-22T09:16:04Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/MachineNotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/approle/roles/{role_name}/secret-id:
+    post:
+      tags: [approle]
+      operationId: createWrappedSecretId
+      summary: Create a wrapped, age-encrypted SecretID for a role
+      description: |
+        Generates a new SecretID for `role_name` on the AppRole auth mount
+        `mount` (default `approle`), response-wraps it with the requested `wrap_ttl` and returns
+        the wrapping token age-encrypted to the authenticated machine's
+        registered recipient.
+
+        The machine must be authorized for `mount`/`role_name` in its
+        registration. The request is not idempotent: every successful call
+        creates a new SecretID in Vault and consumes the challenge token.
+
+        SecretID metadata is set by the server only: it always contains the
+        authenticated `machine_id`. Callers cannot supply metadata, so values
+        on the SecretID and its tokens can be trusted by policies and audit.
+
+        Each machine may create a limited number of SecretIDs per time window
+        (by default 10 per hour, refilling gradually); beyond that the
+        request is answered with 429 and `Retry-After`.
+
+        For roles the server is configured to bind, `cidr_list` and
+        `token_bound_cidrs` are set to the caller's address, so the SecretID
+        and its tokens only work from there; callers cannot set them.
+      parameters:
+        - $ref: '#/components/parameters/Mount'
+        - $ref: '#/components/parameters/RoleName'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWrappedSecretIdRequest'
+            example:
+              wrap_ttl: 5m
+              secret_id:
+                cidr_list: [10.0.0.0/24]
+                ttl: 24h
+                num_uses: 1
+      responses:
+        '201':
+          description: SecretID created, wrapped and encrypted.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WrappedSecretIdResponse'
+              example:
+                machine_id: node-42
+                role_name: my-role
+                mount: approle
+                encrypted_wrap_token:
+                  format: age-armor
+                  recipient: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+                  value: |
+                    -----BEGIN AGE ENCRYPTED FILE-----
+                    YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBleGFtcGxlCg==
+                    -----END AGE ENCRYPTED FILE-----
+                wrap_info:
+                  accessor: 5Bq9eKVYo3vM7TCqyJx9fA2o
+                  ttl: 300
+                  creation_time: '2026-10-22T09:15:04Z'
+                  creation_path: auth/approle/role/my-role/secret-id
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    ageChallenge:
+      type: http
+      scheme: bearer
+      description: |
+        Decrypted plaintext of a challenge from `POST /v1/auth/challenge`.
+        Single-use, short-lived and bound to the `machine_id` it was issued
+        for.
+
+  headers:
+    NoStore:
+      schema:
+        type: string
+        const: no-store
+
+  parameters:
+    Mount:
+      name: mount
+      in: query
+      required: false
+      description: Path of the AppRole auth mount, without the `auth/` prefix.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-][A-Za-z0-9_.-]*$'
+        maxLength: 128
+        default: approle
+      example: approle
+    RoleName:
+      name: role_name
+      in: path
+      required: true
+      description: Name of the AppRole role to issue the SecretID for.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-][A-Za-z0-9_.-]*$'
+        maxLength: 128
+      example: my-role
+
+  schemas:
+    MachineId:
+      type: string
+      description: Identifier of a registered machine.
+      pattern: '^[A-Za-z0-9_-][A-Za-z0-9_.-]*$'
+      maxLength: 128
+
+    AgeRecipient:
+      type: string
+      description: age X25519 recipient (public key) registered for the machine.
+      pattern: '^age1[02-9ac-hj-np-z]{58}$'
+
+    AgeCiphertext:
+      type: object
+      required: [format, value]
+      properties:
+        format:
+          type: string
+          const: age-armor
+          description: ASCII-armored age file (`age --armor`).
+        value:
+          type: string
+          pattern: '^-----BEGIN AGE ENCRYPTED FILE-----'
+
+    ChallengeRequest:
+      type: object
+      additionalProperties: false
+      required: [machine_id]
+      properties:
+        machine_id:
+          $ref: '#/components/schemas/MachineId'
+
+    ChallengeResponse:
+      type: object
+      required: [machine_id, recipient, challenge, expires_at]
+      properties:
+        machine_id:
+          $ref: '#/components/schemas/MachineId'
+        recipient:
+          $ref: '#/components/schemas/AgeRecipient'
+        challenge:
+          allOf:
+            - $ref: '#/components/schemas/AgeCiphertext'
+          description: |
+            age-encrypted bearer token. The plaintext is an opaque ASCII
+            string with at least 256 bits of entropy, used verbatim as
+            `Authorization: Bearer <plaintext>`.
+        expires_at:
+          type: string
+          format: date-time
+          description: Time after which the token is rejected (typically 60 seconds).
+
+    CreateWrappedSecretIdRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        wrap_ttl:
+          $ref: '#/components/schemas/Duration'
+          description: |
+            TTL of the response-wrapping token. Sent to Vault as
+            `X-Vault-Wrap-TTL`. The server may enforce an upper bound.
+          default: 5m
+        secret_id:
+          $ref: '#/components/schemas/SecretIdOptions'
+
+    SecretIdOptions:
+      type: object
+      additionalProperties: false
+      description: |
+        Optional parameters passed through to Vault's
+        `POST auth/{mount}/role/{role_name}/secret-id`. Values are constrained
+        by the role's own settings. Metadata is not accepted; the server
+        sets it.
+      properties:
+        cidr_list:
+          type: array
+          description: CIDR blocks allowed to use the SecretID.
+          items:
+            type: string
+        token_bound_cidrs:
+          type: array
+          description: CIDR blocks allowed to use tokens issued with this SecretID.
+          items:
+            type: string
+        ttl:
+          $ref: '#/components/schemas/Duration'
+          description: |
+            SecretID TTL. Cannot exceed the server's maximum (default 1h), which
+            is also used when omitted, nor the role's `secret_id_ttl`. When
+            omitted and the role's `secret_id_ttl` is shorter, the role's
+            applies.
+        num_uses:
+          type: integer
+          minimum: 0
+          description: |
+            Number of times the SecretID can be used. Cannot exceed the
+            server's maximum (default 1), which is also used when omitted,
+            nor the role's `secret_id_num_uses`. 0 (unlimited) is only accepted
+            if the server has no maximum.
+
+    WrappedSecretIdResponse:
+      type: object
+      required: [machine_id, role_name, mount, encrypted_wrap_token, wrap_info]
+      properties:
+        machine_id:
+          $ref: '#/components/schemas/MachineId'
+        role_name:
+          type: string
+        mount:
+          type: string
+        encrypted_wrap_token:
+          $ref: '#/components/schemas/EncryptedWrapToken'
+        wrap_info:
+          $ref: '#/components/schemas/WrapInfo'
+
+    EncryptedWrapToken:
+      description: |
+        The Vault response-wrapping token, age-encrypted to the machine's
+        registered recipient. The plaintext is the wrapping token as a
+        UTF-8 string.
+      allOf:
+        - $ref: '#/components/schemas/AgeCiphertext'
+        - type: object
+          required: [recipient]
+          properties:
+            recipient:
+              $ref: '#/components/schemas/AgeRecipient'
+
+    WrapInfo:
+      type: object
+      description: Non-sensitive response-wrapping metadata returned by Vault (the token itself is omitted).
+      required: [accessor, ttl, creation_time, creation_path]
+      properties:
+        accessor:
+          type: string
+          description: Accessor of the wrapping token; can be used to look up or revoke it.
+        ttl:
+          type: integer
+          description: Wrapping token TTL in seconds.
+        creation_time:
+          type: string
+          format: date-time
+        creation_path:
+          type: string
+          description: Vault path the wrapped response was created from. Recipients should verify this before unwrapping.
+          example: auth/approle/role/my-role/secret-id
+
+    Duration:
+      description: Duration as seconds (integer) or a Go-style duration string (e.g. `90s`, `5m`, `24h`).
+      oneOf:
+        - type: integer
+          minimum: 1
+        - type: string
+          pattern: '^[0-9]+(s|m|h)$'
+
+    Error:
+      type: object
+      required: [errors]
+      properties:
+        errors:
+          type: array
+          items:
+            type: string
+
+  responses:
+    BadRequest:
+      description: Malformed request, e.g. invalid JSON or duration.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing, expired, already used or unknown challenge token.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            const: Bearer
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The authenticated machine is not authorized for this mount and role.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: The mount or role does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    MachineNotFound:
+      description: No machine is registered under `machine_id`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: |
+        Rate limit exceeded: challenge requests from this client address, pending
+        challenges for this machine from it, or SecretIDs created by this machine.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnprocessableEntity:
+      description: Request is well-formed but rejected, e.g. `wrap_ttl` above the server limit or SecretID options not permitted by the role.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadGateway:
+      description: Vault/OpenBao returned an unexpected error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Vault/OpenBao is sealed or unreachable, or the machine registry cannot be read.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

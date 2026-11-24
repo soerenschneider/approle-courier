@@ -1,0 +1,90 @@
+{#-
+  approle-courier configuration for a node in the "openbao" group, behind the
+  HAProxy frontend from haproxy-approle-courier.cfg.j2. Renders with
+  Ansible (uses its to_nice_json, combine, extract and mandatory filters).
+
+  Required:
+    approle_courier_role_id       role_id of approle-courier's own AppRole
+    haproxy_openbao_port          port of the OpenBao HAProxy frontend; not
+                                  needed if approle_courier_vault_address is set
+
+  Optional, with defaults:
+    approle_courier_listen_address         "" (all addresses); e.g. a node's
+                                           own address or "127.0.0.1". With
+                                           a loopback address only the local
+                                           HAProxy reaches this instance, and
+                                           the other nodes' HAProxies mark it
+                                           down.
+    approle_courier_port                   8300
+    approle_courier_metrics_listen         ":9090"; "" disables metrics
+    approle_courier_tls_cert               unset: plain HTTP, HAProxy
+                                           terminates TLS. Set together with
+                                           approle_courier_tls_key to serve
+                                           TLS; the certificate (chain) is
+                                           reloaded when it changes
+    approle_courier_tls_key                its private key, readable by
+                                           approle-courier
+    approle_courier_proxy_protocol         false; set to true behind HAProxy
+    approle_courier_trusted_proxies        addresses of all OpenBao nodes,
+                                           from ansible_default_ipv4 (needs
+                                           facts); 127.0.0.1 is always added
+    approle_courier_vault_address          "https://<inventory_hostname>:<haproxy_openbao_port>"
+    approle_courier_approle_mount          "approle-service"
+    approle_courier_secret_id_file         "/etc/approle-courier/secret-id"
+    approle_courier_registry_kv_mount      "secret"
+    approle_courier_registry_kv_path       "approle-courier/registry"
+    approle_courier_registry_cache_ttl     "30s"
+    approle_courier_exclusive_secret_id    []  e.g. ["approle/vm-*"]
+    approle_courier_bind_client_address    []
+    approle_courier_log_level              "info"
+    approle_courier_extra_config           {}  merged recursively over the
+                                           result, for any other setting,
+                                           e.g. {"limits": {"max_wrap_ttl": "5m"}}
+-#}
+{%- set trusted_proxies = approle_courier_trusted_proxies
+      | default(groups['openbao'] | map('extract', hostvars, ['ansible_default_ipv4', 'address']) | list) -%}
+{%- set listen_address = approle_courier_listen_address | default('') -%}
+{%- if ':' in listen_address and not listen_address.startswith('[') -%}
+{%-   set listen_address = '[' ~ listen_address ~ ']' -%}
+{%- endif -%}
+{%- set listen = {
+  "api": listen_address ~ ":" ~ (approle_courier_port | default(8300)),
+  "metrics": approle_courier_metrics_listen | default(":9090"),
+  "proxy_protocol": approle_courier_proxy_protocol | default(false),
+  "trusted_proxies": (["127.0.0.1"] + trusted_proxies) | unique | list,
+} -%}
+{%- if approle_courier_tls_cert is defined or approle_courier_tls_key is defined -%}
+{%-   set listen = listen | combine({
+        "tls_cert": approle_courier_tls_cert | mandatory,
+        "tls_key": approle_courier_tls_key | mandatory,
+      }) -%}
+{%- endif -%}
+{%- if approle_courier_vault_address is defined -%}
+{%-   set vault_address = approle_courier_vault_address -%}
+{%- else -%}
+{%-   set vault_address = "https://" ~ inventory_hostname ~ ":" ~ (haproxy_openbao_port | mandatory) -%}
+{%- endif -%}
+{%- set config = {
+  "listen": listen,
+  "limits": {
+    "exclusive_secret_id": approle_courier_exclusive_secret_id | default([]),
+    "bind_client_address": approle_courier_bind_client_address | default([]),
+  },
+  "log": {
+    "level": approle_courier_log_level | default("info"),
+  },
+  "registry": {
+    "kv_mount": approle_courier_registry_kv_mount | default("secret"),
+    "kv_path": approle_courier_registry_kv_path | default("approle-courier/registry"),
+    "cache_ttl": approle_courier_registry_cache_ttl | default("30s"),
+  },
+  "vault": {
+    "address": vault_address,
+    "approle": {
+      "mount": approle_courier_approle_mount | default("approle-service"),
+      "role_id": approle_courier_role_id | mandatory,
+      "secret_id_file": approle_courier_secret_id_file | default("/etc/approle-courier/secret-id"),
+    },
+  },
+} | combine(approle_courier_extra_config | default({}), recursive=True) -%}
+{{ config | to_nice_json }}
